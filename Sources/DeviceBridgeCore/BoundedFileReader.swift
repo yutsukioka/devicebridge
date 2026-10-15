@@ -8,6 +8,11 @@ enum BoundedFileReader {
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
         guard descriptor >= 0 else { throw posixError("Open \(label.lowercased())") }
         defer { Darwin.close(descriptor) }
+        return try read(descriptor: descriptor, maximumBytes: maximumBytes, label: label)
+    }
+
+    /// The caller owns the already-open descriptor and closes it after reading.
+    static func read(descriptor: Int32, maximumBytes: Int, label: String) throws -> Data {
         var info = stat()
         guard Darwin.fstat(descriptor, &info) == 0 else { throw posixError("Inspect \(label.lowercased())") }
         guard (info.st_mode & S_IFMT) == S_IFREG else {

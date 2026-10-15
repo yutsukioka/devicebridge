@@ -17,6 +17,7 @@ public protocol DeviceStorage: AnyObject {
 @MainActor
 public final class FileDeviceStorage: DeviceStorage {
     public let rootURL: URL
+    private let rootDescriptor: Int32
     private let lockDescriptor: Int32
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
@@ -38,13 +39,32 @@ public final class FileDeviceStorage: DeviceStorage {
     public init(rootURL: URL) throws {
         self.rootURL = rootURL.standardizedFileURL
         try Self.prepareDirectory(self.rootURL)
-        let lockURL = self.rootURL.appendingPathComponent(".writer.lock")
-        let descriptor = Darwin.open(lockURL.path, O_CREAT | O_RDWR | O_NOFOLLOW, S_IRUSR | S_IWUSR)
-        guard descriptor >= 0 else { throw Self.posixError("Open demo store lock") }
-        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-            Darwin.close(descriptor)
-            throw DeviceBridgeError.storeInUse
+        // Pin the directory for this storage lifetime. Later path replacement
+        // must not redirect I/O away from the directory whose lock we hold.
+        let directory = Darwin.open(self.rootURL.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard directory >= 0 else { throw Self.posixError("Open demo store directory") }
+        let descriptor = Darwin.openat(directory, ".writer.lock",
+                                       O_CREAT | O_RDWR | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            let error = Self.posixError("Open demo store lock")
+            Darwin.close(directory)
+            throw error
         }
+        do {
+            var info = stat()
+            guard Darwin.fstat(descriptor, &info) == 0 else { throw Self.posixError("Inspect demo store lock") }
+            guard (info.st_mode & S_IFMT) == S_IFREG else {
+                throw DeviceBridgeError.invalidStore("Demo store lock must be a regular file.")
+            }
+            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { throw DeviceBridgeError.storeInUse }
+            // Only the locked writer may remove files abandoned before rename.
+            try Self.removeAbandonedWrites(in: directory)
+        } catch {
+            Darwin.close(descriptor)
+            Darwin.close(directory)
+            throw error
+        }
+        self.rootDescriptor = directory
         self.lockDescriptor = descriptor
         encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -56,12 +76,12 @@ public final class FileDeviceStorage: DeviceStorage {
     deinit {
         _ = flock(lockDescriptor, LOCK_UN)
         Darwin.close(lockDescriptor)
+        Darwin.close(rootDescriptor)
     }
 
     public func loadJobs() throws -> [SyncJob] {
-        let url = rootURL.appendingPathComponent("queue.json")
-        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
-        let catalog = try decoder.decode(Catalog.self, from: readBounded(url))
+        guard let data = try readBounded("queue.json", in: rootDescriptor) else { return [] }
+        let catalog = try decoder.decode(Catalog.self, from: data)
         guard catalog.schemaVersion == 1, catalog.syntheticDemo else {
             throw DeviceBridgeError.invalidStore("Unsupported queue catalog.")
         }
@@ -72,13 +92,14 @@ public final class FileDeviceStorage: DeviceStorage {
     public func saveJobs(_ jobs: [SyncJob]) throws {
         try Self.validateJobs(jobs)
         let data = try encoder.encode(Catalog(schemaVersion: 1, syntheticDemo: true, jobs: jobs))
-        try atomicWrite(data, to: rootURL.appendingPathComponent("queue.json"))
+        try atomicWrite(data, named: "queue.json", in: rootDescriptor)
     }
 
     public func loadRecords(for device: DemoDeviceKey) throws -> DeviceRecords {
-        let url = recordsURL(for: device)
-        guard FileManager.default.fileExists(atPath: url.path) else { return DeviceRecords() }
-        let snapshot = try decoder.decode(Snapshot.self, from: readBounded(url))
+        guard let directory = try recordsDirectory(for: device, create: false) else { return DeviceRecords() }
+        defer { Darwin.close(directory) }
+        guard let data = try readBounded("records.json", in: directory) else { return DeviceRecords() }
+        let snapshot = try decoder.decode(Snapshot.self, from: data)
         guard snapshot.schemaVersion == 1, snapshot.syntheticDemo, snapshot.fixture.device == device else {
             throw DeviceBridgeError.invalidStore("Device snapshot identity does not match its isolated directory.")
         }
@@ -88,11 +109,12 @@ public final class FileDeviceStorage: DeviceStorage {
 
     public func saveRecords(_ records: DeviceRecords, fixture: DemoFixture) throws {
         try Self.validateRecords(records, fixture: fixture)
-        let url = recordsURL(for: fixture.device)
-        try Self.prepareDirectory(rootURL.appendingPathComponent("devices", isDirectory: true))
-        try Self.prepareDirectory(url.deletingLastPathComponent())
+        guard let directory = try recordsDirectory(for: fixture.device, create: true) else {
+            throw DeviceBridgeError.invalidStore("Device snapshot directory is missing.")
+        }
+        defer { Darwin.close(directory) }
         let snapshot = Snapshot(schemaVersion: 1, syntheticDemo: true, fixture: fixture, records: records)
-        try atomicWrite(try encoder.encode(snapshot), to: url)
+        try atomicWrite(try encoder.encode(snapshot), named: "records.json", in: directory)
     }
 
     public func recordsURL(for device: DemoDeviceKey) -> URL {
@@ -117,14 +139,33 @@ public final class FileDeviceStorage: DeviceStorage {
         }
     }
 
-    private func readBounded(_ url: URL) throws -> Data {
-        try Self.rejectSymlink(url)
-        // Check each device directory as well as the file itself.
-        if url.lastPathComponent == "records.json" {
-            try Self.rejectSymlink(rootURL.appendingPathComponent("devices"))
-            try Self.rejectSymlink(url.deletingLastPathComponent())
+    private func readBounded(_ name: String, in directory: Int32) throws -> Data? {
+        let descriptor = Darwin.openat(directory, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            if errno == ENOENT { return nil }
+            throw Self.posixError("Open store file")
         }
-        return try BoundedFileReader.read(url, maximumBytes: Self.maximumStoreBytes, label: "Store file")
+        defer { Darwin.close(descriptor) }
+        return try BoundedFileReader.read(descriptor: descriptor, maximumBytes: Self.maximumStoreBytes, label: "Store file")
+    }
+
+    private func recordsDirectory(for device: DemoDeviceKey, create: Bool) throws -> Int32? {
+        guard let devices = try Self.openDirectory("devices", in: rootDescriptor, create: create) else { return nil }
+        defer { Darwin.close(devices) }
+        return try Self.openDirectory(device.id.uuidString.lowercased(), in: devices, create: create)
+    }
+
+    /// Each name is one fixed path component, never a slash-separated path.
+    private static func openDirectory(_ name: String, in parent: Int32, create: Bool) throws -> Int32? {
+        if create, Darwin.mkdirat(parent, name, S_IRWXU) != 0, errno != EEXIST {
+            throw posixError("Create demo state directory")
+        }
+        let descriptor = Darwin.openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            if !create, errno == ENOENT { return nil }
+            throw posixError("Open demo state directory")
+        }
+        return descriptor
     }
 
     private static func prepareDirectory(_ url: URL) throws {
@@ -140,17 +181,25 @@ public final class FileDeviceStorage: DeviceStorage {
         }
     }
 
-    private func atomicWrite(_ data: Data, to url: URL) throws {
+    private func atomicWrite(_ data: Data, named name: String, in directory: Int32) throws {
         guard data.count <= Self.maximumStoreBytes else {
             throw DeviceBridgeError.invalidStore("Store file exceeds the 4 MiB prototype limit.")
         }
-        try Self.rejectSymlink(url)
-        let temporary = url.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).tmp")
-        let descriptor = Darwin.open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+        var info = stat()
+        if Darwin.fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) == 0 {
+            guard (info.st_mode & S_IFMT) != S_IFLNK else {
+                throw DeviceBridgeError.invalidStore("Symbolic links are not supported for demo state files or directories.")
+            }
+        } else if errno != ENOENT {
+            throw Self.posixError("Inspect demo state file")
+        }
+        let temporary = ".\(UUID().uuidString).tmp"
+        let descriptor = Darwin.openat(directory, temporary,
+                                       O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else { throw Self.posixError("Create atomic demo state file") }
         defer {
             Darwin.close(descriptor)
-            Darwin.unlink(temporary.path)
+            Darwin.unlinkat(directory, temporary, 0)
         }
         try data.withUnsafeBytes { buffer in
             guard let address = buffer.baseAddress else { return }
@@ -163,13 +212,58 @@ public final class FileDeviceStorage: DeviceStorage {
             }
         }
         guard Darwin.fsync(descriptor) == 0 else { throw Self.posixError("Flush demo state") }
-        guard Darwin.rename(temporary.path, url.path) == 0 else { throw Self.posixError("Commit demo state") }
+        guard Darwin.renameat(directory, temporary, directory, name) == 0 else { throw Self.posixError("Commit demo state") }
         // The new file is now committed. Directory flush is best effort because
         // filesystem support differs; this is not a hardware power-loss guarantee.
-        let directory = Darwin.open(url.deletingLastPathComponent().path, O_RDONLY)
-        if directory >= 0 {
-            _ = Darwin.fsync(directory)
-            Darwin.close(directory)
+        _ = Darwin.fsync(directory)
+    }
+
+    private static func removeAbandonedWrites(in root: Int32) throws {
+        try removeTemporaryFiles(in: root)
+        guard let devices = try openDirectory("devices", in: root, create: false) else { return }
+        defer { Darwin.close(devices) }
+        for device in DemoDeviceKey.allCases {
+            if let directory = try openDirectory(device.id.uuidString.lowercased(), in: devices, create: false) {
+                defer { Darwin.close(directory) }
+                try removeTemporaryFiles(in: directory)
+            }
+        }
+    }
+
+    private static func removeTemporaryFiles(in directory: Int32) throws {
+        // A separate directory stream leaves the retained descriptor's offset alone.
+        let descriptor = Darwin.openat(directory, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard descriptor >= 0 else { throw posixError("Open demo temporary-file directory") }
+        guard let stream = fdopendir(descriptor) else {
+            let error = posixError("Inspect demo temporary-file directory")
+            Darwin.close(descriptor)
+            throw error
+        }
+        defer { closedir(stream) }
+        while true {
+            errno = 0
+            guard let entry = readdir(stream) else {
+                if errno != 0 { throw posixError("List demo temporary files") }
+                break
+            }
+            let name = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
+            }
+            // Match only the exact names produced by atomicWrite, in known store
+            // directories. Never recurse into arbitrary folders or follow links.
+            guard name.count == 41, name.hasPrefix("."), name.hasSuffix(".tmp"),
+                  let id = UUID(uuidString: String(name.dropFirst().dropLast(4))),
+                  name == ".\(id.uuidString).tmp" else { continue }
+            var info = stat()
+            guard Darwin.fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
+                if errno == ENOENT { continue }
+                throw posixError("Inspect abandoned demo write")
+            }
+            guard (info.st_mode & S_IFMT) == S_IFREG else { continue }
+            guard Darwin.unlinkat(directory, name, 0) == 0 else {
+                if errno == ENOENT { continue }
+                throw posixError("Remove abandoned demo write")
+            }
         }
     }
 
