@@ -56,6 +56,10 @@ Only `aurora` and `borealis`, and `baseline` and `refresh`, are accepted. Unknow
 
 The default UI store is a dedicated `DeviceBridge/SyntheticDemo` directory under the current user's Application Support folder. `--store-root PATH` selects an alternative dedicated directory. Demo records are stored separately per device, while a shared queue persists jobs and their states. A process lock prevents simultaneous cooperating writers. On launch, saved queued/running jobs become interrupted and wait for explicit retry. Completed snapshots remain readable. A retry replaces the selected device snapshot; other devices' histories remain separate.
 
+Store I/O is anchored to the directory opened and locked at initialization, so replacing its pathname later cannot redirect reads or writes. Device subdirectories are opened one component at a time without following symlinks; dangling state-file symlinks are reported as errors. On startup, after acquiring the writer lock, the store removes regular files matching the atomic writer's exact `.UUID.tmp` naming convention from the root and the two known device directories. Unrelated names, directories, symlinks and special files are left alone.
+
+The selected root and its ancestors must be trusted when opening the store. Descriptor-relative access prevents pathname redirection after opening; it does not prevent another process with filesystem write access from directly modifying files or replacing the advisory lock. See [issue #1 verification](docs/issue-1-verification.md) for the reproduced failures, repairs and remaining test limits.
+
 **Demo storage is plaintext.** Encryption, Keychain integration, independently verified consent, production file hardening, retention controls, sandboxing, and a security audit remain future work. Atomic file replacement and process-exit recovery tests do not prove physical power-loss durability. Work runs only while the app or harness is running and the host is available; no background service or unattended sync is installed.
 
 ## Verification
@@ -73,4 +77,4 @@ On 6 October 2026, all 13 automated tests and the fixture/recovery harness passe
 - [Roadmap](docs/roadmap.md): prototype acceptance and gated USB/Wi-Fi work.
 - [Verification](docs/verification.md): exact commands, environment, results and remaining gaps.
 
-No Qustodio binaries, code, or assets are included or reused. No upstream device libraries are embedded in this milestone. Any future libimobiledevice integration requires pinned source, component-level license review, native arm64 builds, consent design, and explicit scope approval. This repository is local only; no remote publication is configured.
+No Qustodio binaries, code, or assets are included or reused. No upstream device libraries are embedded in this milestone. Any future libimobiledevice integration requires pinned source, component-level license review, native arm64 builds, consent design, and explicit scope approval.
